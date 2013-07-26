@@ -222,6 +222,7 @@ typedef struct _pam_mysql_ctx_t {
 	char *update_table;
 	char *usercolumn;
 	char *passwdcolumn;
+    char *saltcolumn;
 	char *statcolumn;
 	int crypt_type;
 	int use_323_passwd;
@@ -231,6 +232,7 @@ typedef struct _pam_mysql_ctx_t {
 	int use_first_pass;
 	int try_first_pass;
 	int disconnect_every_op;
+    int digest_iterations;
 	char *logtable;
 	char *logmsgcolumn;
 	char *logpidcolumn;
@@ -923,6 +925,10 @@ static pam_mysql_err_t pam_mysql_crypt_opt_getter(void *val, const char **pretva
 		case 6:
 			*pretval = "joomla15";
 			break;
+			
+		case 7:
+			*pretval = "digest";
+			break;			
 
 		default:
 			*pretval = NULL;
@@ -970,6 +976,11 @@ static pam_mysql_err_t pam_mysql_crypt_opt_setter(void *val, const char *newval_
 		return PAM_MYSQL_ERR_SUCCESS;
 	}
 
+    if (strcmp(newval_str, "7") == 0 || strcasecmp(newval_str, "digest") == 0) {
+        *(int *)val = 7;
+        return PAM_MYSQL_ERR_SUCCESS;
+    }
+
 	*(int *)val = 0;
 
 	return PAM_MYSQL_ERR_INVAL;
@@ -1011,6 +1022,7 @@ static pam_mysql_option_t options[] = {
 	PAM_MYSQL_DEF_OPTION(update_table, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION(usercolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION(passwdcolumn, &pam_mysql_string_opt_accr),
+    PAM_MYSQL_DEF_OPTION(saltcolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION(statcolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(crypt, crypt_type, &pam_mysql_crypt_opt_accr),
 	PAM_MYSQL_DEF_OPTION(md5, &pam_mysql_boolean_opt_accr),
@@ -1908,6 +1920,7 @@ static pam_mysql_option_t pam_mysql_entry_handler_options[] = {
 	PAM_MYSQL_DEF_OPTION2(users.update_table, update_table, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(users.user_column, usercolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(users.password_column, passwdcolumn, &pam_mysql_string_opt_accr),
+    PAM_MYSQL_DEF_OPTION2(users.saltcolumn, saltcolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(users.status_column, statcolumn, &pam_mysql_string_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(users.password_crypt, crypt_type, &pam_mysql_crypt_opt_accr),
 	PAM_MYSQL_DEF_OPTION2(users.use_md5, md5, &pam_mysql_boolean_opt_accr),
@@ -2185,6 +2198,7 @@ static pam_mysql_err_t pam_mysql_init_ctx(pam_mysql_ctx_t *ctx)
 	ctx->update_table =NULL;
 	ctx->usercolumn = NULL;
 	ctx->passwdcolumn = NULL;
+    ctx->saltcolumn = NULL;
 	ctx->statcolumn = xstrdup("0");
 	ctx->crypt_type = 0;
 	ctx->use_323_passwd = 0;
@@ -2194,6 +2208,7 @@ static pam_mysql_err_t pam_mysql_init_ctx(pam_mysql_ctx_t *ctx)
 	ctx->use_first_pass = 0;
 	ctx->try_first_pass = 1;
 	ctx->disconnect_every_op = 0;
+    ctx->digest_iterations = 5000;
 	ctx->logtable = NULL;
 	ctx->logmsgcolumn = NULL;
 	ctx->logpidcolumn = NULL;
@@ -2243,6 +2258,9 @@ static void pam_mysql_destroy_ctx(pam_mysql_ctx_t *ctx)
 
 	xfree(ctx->passwdcolumn);
 	ctx->passwdcolumn = NULL;
+    
+    xfree(ctx->saltcolumn);
+    ctx->saltcolumn = NULL;
 
 	xfree(ctx->statcolumn);
 	ctx->statcolumn = NULL;
@@ -2811,11 +2829,20 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
 		return err;
 	}
 
-	err = pam_mysql_format_string(ctx, &query,
-		(ctx->where == NULL ?
-			"SELECT %[passwdcolumn] FROM %[table] WHERE %[usercolumn] = '%s'":
-			"SELECT %[passwdcolumn] FROM %[table] WHERE %[usercolumn] = '%s' AND (%S)"),
-				1, user, ctx->where);
+    if (ctx->crypt_type == 7) {
+        err = pam_mysql_format_string(ctx, &query, (
+                                      ctx->where == NULL ?
+                                                    "SELECT %[passwdcolumn], %[saltcolumn] FROM %[table] WHERE %[usercolumn] = '%s'" :
+                                                    "SELECT %[passwdcolumn], %[saltcolumn] FROM %[table] WHERE %[usercolumn] = '%s' AND (%S)"),
+                                      1, user, ctx->where);
+        
+    } else {
+        err = pam_mysql_format_string(ctx, &query,
+                                      (ctx->where == NULL ?
+                                       "SELECT %[passwdcolumn] FROM %[table] WHERE %[usercolumn] = '%s'":
+                                       "SELECT %[passwdcolumn] FROM %[table] WHERE %[usercolumn] = '%s' AND (%S)"),
+                                      1, user, ctx->where);
+    }
 
 	if (err) {
 		goto out;
@@ -2981,6 +3008,56 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
 #else
 					syslog(LOG_AUTHPRIV | LOG_ERR, PAM_MYSQL_LOG_PREFIX "non-crypt()ish MD5 hash is not supported in this build.");
 #endif
+				} break;
+				
+				/* digest salted */
+				case 7: {
+                    char digest[33];
+                    digest[32] = 0;
+                    
+                    char *password = row[0];
+                    char *salt = row[1];
+                    
+					char *salted;
+					int len = strlen(passwd) + strlen(salt) + 2;
+                    
+					if (NULL == (salted = xcalloc(len+1, sizeof(char)))) {
+						syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+						err = PAM_MYSQL_ERR_ALLOC;
+						goto out;
+					}
+                    
+                    strcat(salted, passwd);
+                    strcat(salted, "{");
+                    strcat(salted, salt);
+                    strcat(salted, "}");
+                    pam_mysql_sha512_data((unsigned char*)salted, len, digest);
+                    int iterCount = 1;
+                    for (iterCount; iterCount < ctx->digest_iterations; iterCount++) {
+                        char *digestSalted;
+                        int digestSaltedLen = strlen(digest) + strlen(salted);
+                        
+                        if (NULL == (digestSalted = xcalloc(digestSaltedLen+1, sizeof(char)))) {
+                            syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+                            err = PAM_MYSQL_ERR_ALLOC;
+                            goto out;
+                        }
+                        
+                        strcat(digestSalted, digest);
+                        strcat(digestSalted, salted);
+                        
+                        pam_mysql_sha512_data((unsigned char*)digestSalted, digestSaltedLen, digest);
+                        xfree(digestSalted);
+                    }
+                    
+                    vresult = strcmp(password,digest);
+					{
+						char *p = digest - 1;
+						while (*(++p)) *p = '\0';
+					}
+                    
+                    xfree(salted);
+					
 				} break;
 
 				default: {
@@ -3220,11 +3297,20 @@ static pam_mysql_err_t pam_mysql_update_passwd(pam_mysql_ctx_t *ctx, const char 
 		}
 	}
 
-	err = pam_mysql_format_string(ctx, &query,
-		(ctx->where == NULL ?
-			"UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s'":
-			"UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s' AND (%S)"),
-				1, (encrypted_passwd == NULL ? "": encrypted_passwd), user, ctx->where);
+    if (ctx->crypt_type == 7) {
+        err = pam_mysql_format_string(ctx, &query,
+                                      (ctx->where == NULL ?
+                                       "UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s'" :
+                                       "UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s' AND (%S)"),
+                                      1, (encrypted_passwd == NULL ? "" : encrypted_passwd), user, ctx->where);
+    } else {
+        err = pam_mysql_format_string(ctx, &query,
+                                      (ctx->where == NULL ?
+                                       "UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s'":
+                                       "UPDATE %[table] SET %[passwdcolumn] = '%s' WHERE %[usercolumn] = '%s' AND (%S)"),
+                                      1, (encrypted_passwd == NULL ? "": encrypted_passwd), user, ctx->where);
+    }
+    
 	if (err) {
 		goto out;
 	}
