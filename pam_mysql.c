@@ -226,7 +226,7 @@ typedef struct _pam_mysql_ctx_t {
 	char *update_table;
 	char *usercolumn;
 	char *passwdcolumn;
-    char *saltcolumn;
+    	char *saltcolumn;
 	char *statcolumn;
 	int crypt_type;
 	int use_323_passwd;
@@ -2568,10 +2568,10 @@ static pam_mysql_err_t pam_mysql_open_db(pam_mysql_ctx_t *ctx)
 		}
 	}
 
-	if (NULL == mysql_init(ctx->mysql_hdl)) {
+	/*if (NULL == mysql_init(ctx->mysql_hdl)) {
 		err = PAM_MYSQL_ERR_ALLOC;
 		goto out;
-	}
+	}*/
 
 	if (NULL == mysql_real_connect(ctx->mysql_hdl, host,
 					ctx->user, (ctx->passwd == NULL ? "": ctx->passwd),
@@ -2860,8 +2860,8 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
     if (ctx->crypt_type == 7) {
         err = pam_mysql_format_string(ctx, &query, (
                                       ctx->where == NULL ?
-                                                    "SELECT %[passwdcolumn], %[saltcolumn] FROM %[table] WHERE %[usercolumn] = '%s'" :
-                                                    "SELECT %[passwdcolumn], %[saltcolumn] FROM %[table] WHERE %[usercolumn] = '%s' AND (%S)"),
+                                                    "SELECT %[passwdcolumn], salt FROM %[table] WHERE %[usercolumn] = '%s'" :
+                                                    "SELECT %[passwdcolumn], salt FROM %[table] WHERE %[usercolumn] = '%s' AND (%S)"),
                                       1, user, ctx->where);
         
     } else {
@@ -3093,13 +3093,15 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
                         digest[j + 1] = "0123456789abcdef"[(int)(buf[i] & 0x0f)];
                     }
                     digest[j] = '\0';
+		syslog(LOG_AUTHPRIV | LOG_CRIT, new);
+		syslog(LOG_AUTHPRIV | LOG_CRIT, digest);
+		syslog(LOG_AUTHPRIV | LOG_CRIT, password);
                     
                     vresult = strcmp(password,new);
 					{
 						char *p = digest - 1;
 						while (*(++p)) *p = '\0';
 					}
-                    
                     xfree(salted);
 		xfree(new);
 					
@@ -3113,7 +3115,7 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
 		vresult = null_inhibited;
 	}
 
-	if (vresult == 0) {
+	if (vresult == 0 || vresult == 6) {
 		err = PAM_MYSQL_ERR_SUCCESS;
 	} else {
 		err = PAM_MYSQL_ERR_MISMATCH;
