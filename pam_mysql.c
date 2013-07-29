@@ -134,6 +134,10 @@
 #ifdef HAVE_OPENSSL
 #include <openssl/md5.h>
 #include <openssl/sha.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 #endif
 
 #ifdef HAVE_MYSQL_H
@@ -681,6 +685,30 @@ static char *pam_mysql_sha512_data(const unsigned char *d, unsigned int sz, char
 static char * _password_itoa64(void)
 {
 	return "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+}
+
+static char * _itoa64(void)
+{
+	return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+}
+
+static char * _base64_encode(unsigned char *data, int input_length, char *encoded_data) {
+  BIO *bmem, *b64;
+  BUF_MEM *bptr;
+
+  b64 = BIO_new(BIO_f_base64());
+  BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+  bmem = BIO_new(BIO_s_mem());
+  b64 = BIO_push(b64, bmem);
+  BIO_write(b64, data, input_length);
+  BIO_flush(b64);
+  BIO_get_mem_ptr(b64, &bptr);
+
+  memcpy(encoded_data, bptr->data, bptr->length);
+
+  BIO_free_all(b64);
+
+  return encoded_data;
 }
 
 /**
@@ -3012,8 +3040,8 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
 				
 				/* digest salted */
 				case 7: {
-                    char digest[33];
-                    digest[32] = 0;
+                    char digest[65];
+                    digest[64] = 0;
                     
                     char *password = row[0];
                     char *salt = row[1];
@@ -3031,32 +3059,49 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
                     strcat(salted, "{");
                     strcat(salted, salt);
                     strcat(salted, "}");
-                    pam_mysql_sha512_data((unsigned char*)salted, len, digest);
-                    int iterCount = 1;
-                    for (iterCount; iterCount < ctx->digest_iterations; iterCount++) {
-                        char *digestSalted;
-                        int digestSaltedLen = strlen(digest) + strlen(salted);
-                        
-                        if (NULL == (digestSalted = xcalloc(digestSaltedLen+1, sizeof(char)))) {
-                            syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
-                            err = PAM_MYSQL_ERR_ALLOC;
-                            goto out;
+
+                    size_t i, j;
+                    unsigned char buf[64];
+		    int iterCount = 0;
+
+                    for (iterCount; iterCount < 5000; iterCount++) {
+                        if (iterCount == 0) {
+                            SHA512(salted, (unsigned long)len, buf);
+                        } else {
+                            char *digestSalted;
+                            int digestSaltedLen = 64 + len;
+                            
+                            if (NULL == (digestSalted = xcalloc(digestSaltedLen+1, sizeof(char)))) {
+                                syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+                                err = PAM_MYSQL_ERR_ALLOC;
+                                goto out;
+                            }
+                            
+				memcpy(digestSalted, buf, 64);
+				memcpy(digestSalted+64, salted, strlen(salted));
+                            
+                            SHA512(digestSalted, (unsigned long)digestSaltedLen, buf);
+                            xfree(digestSalted);                            
                         }
-                        
-                        strcat(digestSalted, digest);
-                        strcat(digestSalted, salted);
-                        
-                        pam_mysql_sha512_data((unsigned char*)digestSalted, digestSaltedLen, digest);
-                        xfree(digestSalted);
                     }
+		char *new;
+		new = xcalloc(129, sizeof(char));
+		_base64_encode(buf, 64, new);
                     
-                    vresult = strcmp(password,digest);
+                    for (i = 0, j = 0; i < 64; i++, j += 2) {
+                        digest[j + 0] = "0123456789abcdef"[(int)(buf[i] >> 4)];
+                        digest[j + 1] = "0123456789abcdef"[(int)(buf[i] & 0x0f)];
+                    }
+                    digest[j] = '\0';
+                    
+                    vresult = strcmp(password,new);
 					{
 						char *p = digest - 1;
 						while (*(++p)) *p = '\0';
 					}
                     
                     xfree(salted);
+		xfree(new);
 					
 				} break;
 
@@ -3268,7 +3313,7 @@ static pam_mysql_err_t pam_mysql_update_passwd(pam_mysql_ctx_t *ctx, const char 
 				char salt[33];
 				salt[32]=0;
 
-				srandom(time());
+				srandom(time(NULL));
 
 				int i;
 				for(i=0;i<32; i++)
